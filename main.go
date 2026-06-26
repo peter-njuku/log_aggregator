@@ -7,8 +7,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -24,13 +26,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	fd, err := unix.InotifyInit()
+	fd, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer unix.Close(fd)
 
-	_, err = unix.InotifyAddWatch(fd, dir, unix.IN_CREATE|unix.IN_DELETE)
+	_, err = unix.InotifyAddWatch(fd, dir, unix.IN_CREATE|unix.IN_DELETE|unix.IN_MOVED_FROM)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -45,7 +47,7 @@ func main() {
 
 	for _, f := range files {
 		name := filepath.Base(f)
-		startTailer(f, name, &wg, active)
+		startTailer(ctx, filepath.Join(dir, name), name, &wg, active)
 	}
 
 	go func() {
@@ -63,6 +65,10 @@ func main() {
 			if err == syscall.EINTR {
 				continue
 			}
+			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
 			log.Fatal(err)
 		}
 
@@ -73,17 +79,17 @@ func main() {
 			var name string
 			if event.Len > 0 {
 				nameBytes := buf[i+unix.SizeofInotifyEvent : i+unix.SizeofInotifyEvent+uint32(event.Len)]
-				name = string(nameBytes[:len(nameBytes)-1])
+				name = strings.TrimRight(string(nameBytes), "\x00")
 			}
 			if event.Mask&unix.IN_CREATE != 0 {
-				if matched, _ := filepath.Match(".log", name); matched {
+				if matched, _ := filepath.Match("*.log", name); matched && !strings.HasPrefix(name, ".") {
 					if _, exists := active[name]; !exists {
-						startTailer(dir, name, &wg, active)
+						startTailer(ctx, filepath.Join(dir, name), name, &wg, active)
 					}
 				}
 			}
 
-			if event.Mask&unix.IN_DELETE != 0 {
+			if event.Mask&(unix.IN_DELETE|unix.IN_MOVED_FROM) != 0 {
 				if cancel, ok := active[name]; ok {
 					cancel()
 					delete(active, name)
@@ -97,6 +103,7 @@ func main() {
 	for _, cancel := range active {
 		cancel()
 	}
+	fmt.Fprintln(os.Stderr, "waiting for tailers...")
 	wg.Wait()
 	fmt.Println("All trailers stopped")
 }
