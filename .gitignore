@@ -31,4 +31,6 @@ go.work.sum
 # .idea/
 # .vscode/
 github.sh
+newlog.log
+watchtest.go
 
